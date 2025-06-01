@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 from ..models.models import Ingredient, Recipe, IngredientCreate, IngredientUpdate
 from ..utils.sheets import read_sheet, write_sheet, update_sheet, delete_sheet
 from ..services.llm_service import get_llm_response
@@ -9,6 +9,63 @@ from datetime import datetime, timedelta
 import json
 
 router = APIRouter()
+
+# カテゴリーのマッピング定義
+CATEGORY_MAPPING = {
+    # 野菜関連
+    "野菜": "野菜類",
+    "野菜類": "野菜類",
+    "葉物": "野菜類",
+    "根菜": "野菜類",
+    "果菜": "野菜類",
+    
+    # 肉関連
+    "肉": "肉類",
+    "肉類": "肉類",
+    "牛肉": "肉類",
+    "豚肉": "肉類",
+    "鶏肉": "肉類",
+    
+    # 魚関連
+    "魚": "魚介類",
+    "魚介": "魚介類",
+    "魚介類": "魚介類",
+    "海鮮": "魚介類",
+    "シーフード": "魚介類",
+    
+    # 果物関連
+    "果物": "果物類",
+    "果物類": "果物類",
+    "フルーツ": "果物類",
+    
+    # 乳製品関連
+    "乳製品": "乳製品",
+    "乳": "乳製品",
+    "牛乳": "乳製品",
+    "チーズ": "乳製品",
+    
+    # 調味料関連
+    "調味料": "調味料",
+    "調味": "調味料",
+    "スパイス": "調味料",
+    "香辛料": "調味料",
+    
+    # その他
+    "その他": "その他",
+    "その他の": "その他",
+    "その他の材料": "その他"
+}
+
+def normalize_category(category: str) -> str:
+    """カテゴリー名を正規化する"""
+    if not category:
+        return ""
+    
+    # カテゴリー名を正規化（空白を削除し、小文字に変換）
+    normalized = category.strip().lower()
+    
+    # マッピングから正規化されたカテゴリー名を取得
+    return CATEGORY_MAPPING.get(normalized, category)
 
 class Message(BaseModel):
     role: str
@@ -22,6 +79,7 @@ class ChatResponse(BaseModel):
     action: Optional[dict] = None
     ingredients: Optional[List[dict]] = None
     recipes: Optional[List[dict]] = None
+    category: Optional[str] = None
 
 def find_ingredient_by_name(name: str) -> Optional[tuple[int, Ingredient]]:
     """材料名から材料を検索"""
@@ -95,6 +153,10 @@ async def chat(request: ChatRequest):
                     # 現在の日時を取得
                     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
+                    # カテゴリーを正規化
+                    category = action_data.get("category", "")
+                    normalized_category = normalize_category(category)
+                    
                     # 材料データを準備
                     ingredient_data = [
                         [
@@ -104,7 +166,7 @@ async def chat(request: ChatRequest):
                             action_data["unit"],
                             "",  # expiry_date
                             current_time,
-                            action_data.get("category", "")
+                            normalized_category
                         ]
                     ]
                     
@@ -142,7 +204,11 @@ async def chat(request: ChatRequest):
                 try:
                     ingredients = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A:G")
                     if len(ingredients) > 1:  # ヘッダー行を除く
-                        response["ingredients"] = [
+                        # カテゴリでフィルタリング（正規化されたカテゴリー名を使用）
+                        category = action_data.get("category")
+                        normalized_category = normalize_category(category) if category else None
+                        
+                        filtered_ingredients = [
                             {
                                 "name": row[1],
                                 "quantity": float(row[2]),
@@ -150,10 +216,26 @@ async def chat(request: ChatRequest):
                                 "category": row[6]
                             }
                             for row in ingredients[1:]  # ヘッダー行をスキップ
+                            if not normalized_category or normalize_category(row[6]) == normalized_category
                         ]
-                        response["message"] = "現在の材料一覧です。"
+                        
+                        if filtered_ingredients:
+                            response["ingredients"] = filtered_ingredients
+                            if category:
+                                response["category"] = category
+                                response["message"] = f"{category}の材料一覧です。"
+                            else:
+                                response["message"] = "現在の材料一覧です。"
+                        else:
+                            if category:
+                                response["message"] = f"{category}の材料は登録されていません。"
+                                response["ingredients"] = []  # 空のリストを返す
+                            else:
+                                response["message"] = "現在、材料は登録されていません。"
+                                response["ingredients"] = []  # 空のリストを返す
                     else:
                         response["message"] = "現在、材料は登録されていません。"
+                        response["ingredients"] = []  # 空のリストを返す
                 except Exception as e:
                     print(f"材料一覧取得中にエラーが発生: {str(e)}")  # デバッグ用
                     raise HTTPException(
@@ -233,7 +315,10 @@ async def chat(request: ChatRequest):
                     )
             
             elif action_type == "error":
-                raise HTTPException(status_code=400, detail=action_data.get("message", "エラーが発生しました。"))
+                # エラーアクションの場合は、エラーメッセージを返すが、HTTPエラーは発生させない
+                response["message"] = action_data.get("message", "エラーが発生しました。")
+                response["ingredients"] = []  # 空のリストを返す
+                return response
         
         return response
     
