@@ -6,19 +6,22 @@ from ..utils.sheets import read_sheet, write_sheet, update_sheet, delete_sheet
 from ..services.llm_service import get_llm_response
 import os
 from datetime import datetime, timedelta
+import json
 
 router = APIRouter()
 
-class ChatMessage(BaseModel):
+class Message(BaseModel):
     role: str
     content: str
 
 class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
+    messages: List[Message]
 
 class ChatResponse(BaseModel):
     message: str
     action: Optional[dict] = None
+    ingredients: Optional[List[dict]] = None
+    recipes: Optional[List[dict]] = None
 
 def find_ingredient_by_name(name: str) -> Optional[tuple[int, Ingredient]]:
     """材料名から材料を検索"""
@@ -49,151 +52,194 @@ def format_date(date_str: str) -> str:
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """チャットメッセージを処理し、適切なアクションを実行"""
     try:
-        # 最後のユーザーメッセージを取得
-        user_message = next((msg.content for msg in reversed(request.messages) 
-                           if msg.role == "user"), None)
-        if not user_message:
-            raise HTTPException(status_code=400, detail="No user message found")
-
-        # LLMにメッセージを送信して意図を解析
-        llm_response = await get_llm_response(request.messages)
+        # メッセージを処理
+        messages = [{"role": "user", "content": msg.content} for msg in request.messages]
         
-        # LLMの応答に基づいてアクションを実行
-        action = None
-        if "action" in llm_response:
-            action = llm_response["action"]
-            if action["type"] == "add_ingredient":
-                # 単一の材料の追加
-                ingredient = IngredientCreate(
-                    name=action["data"]["name"],
-                    quantity=action["data"]["quantity"],
-                    unit=action["data"]["unit"],
-                    category=action["data"]["category"],
-                    expiry_date=datetime.fromisoformat(action["data"]["expiry_date"]) 
-                    if "expiry_date" in action["data"] else None
+        # LLMからの応答を取得
+        llm_response = get_llm_response(messages)
+        print(f"LLM Response: {llm_response}")  # デバッグ用
+        
+        # LLMの応答からJSONを抽出
+        import re
+        import json
+        
+        # コードブロック内のJSONを抽出
+        json_match = re.search(r'```json\n(.*?)\n```', llm_response["message"], re.DOTALL)
+        if json_match:
+            try:
+                response = json.loads(json_match.group(1))
+                print(f"Parsed JSON: {response}")  # デバッグ用
+            except json.JSONDecodeError as e:
+                print(f"JSONのパースに失敗: {str(e)}")  # デバッグ用
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"LLMの応答のパースに失敗しました: {str(e)}"
                 )
-                # 材料を追加する処理を実行
-                values = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A2:A")
-                new_id = len(values) + 1
-                new_row = [
-                    new_id,
-                    ingredient.name,
-                    ingredient.quantity,
-                    ingredient.unit,
-                    ingredient.expiry_date.isoformat() if ingredient.expiry_date else "",
-                    datetime.now().isoformat(),
-                    ingredient.category
-                ]
-                write_sheet(os.getenv("GOOGLE_SHEETS_ID"), f"Ingredients!A{new_id+1}", [new_row])
-
-            elif action["type"] == "add_multiple_ingredients":
-                # 複数の材料の追加
-                values = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A2:A")
-                start_id = len(values) + 1
-                new_rows = []
-                
-                for i, ingredient_data in enumerate(action["data"]):
-                    ingredient = IngredientCreate(
-                        name=ingredient_data["name"],
-                        quantity=ingredient_data["quantity"],
-                        unit=ingredient_data["unit"],
-                        category=ingredient_data["category"],
-                        expiry_date=datetime.fromisoformat(ingredient_data["expiry_date"]) 
-                        if "expiry_date" in ingredient_data else None
+        else:
+            # JSONが見つからない場合は、メッセージのみを返す
+            response = {"message": llm_response["message"]}
+        
+        # アクションの処理
+        if "action" in response:
+            action = response["action"]
+            action_type = action.get("type")
+            action_data = action.get("data", {})
+            
+            if action_type == "add_ingredient":
+                try:
+                    # 新しい材料IDを生成
+                    ingredients = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A:G")
+                    new_id = str(len(ingredients))  # ヘッダー行を考慮
+                    
+                    # 現在の日時を取得
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # 材料データを準備
+                    ingredient_data = [
+                        [
+                            new_id,
+                            action_data["name"],
+                            str(action_data["quantity"]),
+                            action_data["unit"],
+                            "",  # expiry_date
+                            current_time,
+                            action_data.get("category", "")
+                        ]
+                    ]
+                    
+                    print(f"Writing ingredient data: {ingredient_data}")  # デバッグ用
+                    
+                    # スプレッドシートに書き込み
+                    write_sheet(
+                        os.getenv("GOOGLE_SHEETS_ID"),
+                        "Ingredients!A:G",
+                        ingredient_data
                     )
-                    new_rows.append([
-                        start_id + i,
-                        ingredient.name,
-                        ingredient.quantity,
-                        ingredient.unit,
-                        ingredient.expiry_date.isoformat() if ingredient.expiry_date else "",
-                        datetime.now().isoformat(),
-                        ingredient.category
-                    ])
-                
-                # 複数の材料を一度に追加
-                write_sheet(os.getenv("GOOGLE_SHEETS_ID"), 
-                           f"Ingredients!A{start_id+1}:G{start_id+len(new_rows)}", 
-                           new_rows)
-
-            elif action["type"] == "update_ingredient":
-                # 材料の更新
-                ingredient_name = action["data"]["name"]
-                result = find_ingredient_by_name(ingredient_name)
-                if not result:
-                    raise HTTPException(status_code=404, detail=f"材料 '{ingredient_name}' が見つかりません")
-                
-                row_id, current_ingredient = result
-                
-                # 更新データの準備
-                update_data = {}
-                if "expiry_date" in action["data"]:
-                    # 日付をフォーマット
-                    formatted_date = format_date(action["data"]["expiry_date"])
-                    update_data["expiry_date"] = datetime.strptime(formatted_date, "%Y-%m-%d")
-                
-                # 材料を更新
-                updated_ingredient = current_ingredient.copy(update=update_data)
-                updated_row = [
-                    current_ingredient.id,
-                    updated_ingredient.name,
-                    updated_ingredient.quantity,
-                    updated_ingredient.unit,
-                    updated_ingredient.expiry_date.strftime("%Y-%m-%d") if updated_ingredient.expiry_date else "",
-                    datetime.now().isoformat(),
-                    updated_ingredient.category
-                ]
-                update_sheet(os.getenv("GOOGLE_SHEETS_ID"), 
-                           f"Ingredients!A{row_id+1}", [updated_row])
-
-            elif action["type"] == "delete_ingredient":
-                # 材料の削除
-                ingredient_name = action["data"]["name"]
-                result = find_ingredient_by_name(ingredient_name)
-                if not result:
-                    raise HTTPException(status_code=404, detail=f"材料 '{ingredient_name}' が見つかりません")
-                
-                row_id, _ = result
-                delete_sheet(os.getenv("GOOGLE_SHEETS_ID"), 
-                           f"Ingredients!A{row_id+1}:G{row_id+1}")
-
-            elif action["type"] == "list_ingredients":
-                # 材料一覧の取得
-                values = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A2:G")
-                ingredients = []
-                for row in values:
-                    ingredient = Ingredient(
-                        id=int(row[0]),
-                        name=row[1],
-                        quantity=float(row[2]),
-                        unit=row[3],
-                        expiry_date=datetime.fromisoformat(row[4]) if row[4] else None,
-                        updated_at=datetime.fromisoformat(row[5]),
-                        category=row[6]
+                    
+                    # 材料一覧を取得して返す
+                    ingredients = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A:G")
+                    if len(ingredients) > 1:  # ヘッダー行を除く
+                        response["ingredients"] = [
+                            {
+                                "name": row[1],
+                                "quantity": float(row[2]),
+                                "unit": row[3],
+                                "category": row[6]
+                            }
+                            for row in ingredients[1:]  # ヘッダー行をスキップ
+                        ]
+                    
+                    response["message"] = f"{action_data['name']} {action_data['quantity']}{action_data['unit']}を追加しました。"
+                except Exception as e:
+                    print(f"材料追加中にエラーが発生: {str(e)}")  # デバッグ用
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"材料の追加中にエラーが発生しました: {str(e)}"
                     )
-                    ingredients.append(ingredient)
-                
-                # 材料一覧をメッセージに含める
-                ingredient_list = "\n".join([
-                    f"- {ing.name}: {ing.quantity}{ing.unit} ({ing.category})"
-                    + (f" 消費期限: {ing.expiry_date.strftime('%Y-%m-%d')}" if ing.expiry_date else "")
-                    for ing in ingredients
-                ])
-                llm_response["message"] = f"現在の材料一覧です：\n{ingredient_list}"
-
-            elif action["type"] == "search_recipes":
-                # レシピの検索
-                recipes = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Recipes!A2:G")
-                # 検索条件に基づいてレシピをフィルタリング
-                # 結果をLLMの応答に含める
-
-        return ChatResponse(
-            message=llm_response["message"],
-            action=action
-        )
-
+            
+            elif action_type == "list_ingredients":
+                try:
+                    ingredients = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A:G")
+                    if len(ingredients) > 1:  # ヘッダー行を除く
+                        response["ingredients"] = [
+                            {
+                                "name": row[1],
+                                "quantity": float(row[2]),
+                                "unit": row[3],
+                                "category": row[6]
+                            }
+                            for row in ingredients[1:]  # ヘッダー行をスキップ
+                        ]
+                        response["message"] = "現在の材料一覧です。"
+                    else:
+                        response["message"] = "現在、材料は登録されていません。"
+                except Exception as e:
+                    print(f"材料一覧取得中にエラーが発生: {str(e)}")  # デバッグ用
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"材料一覧の取得中にエラーが発生しました: {str(e)}"
+                    )
+            
+            elif action_type == "update_ingredient":
+                try:
+                    ingredients = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A:G")
+                    for i, row in enumerate(ingredients[1:], 1):  # ヘッダー行をスキップ
+                        if row[1] == action_data["name"]:
+                            row[2] = str(action_data["quantity"])
+                            row[3] = action_data["unit"]
+                            row[5] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            write_sheet(
+                                os.getenv("GOOGLE_SHEETS_ID"),
+                                f"Ingredients!A{i+1}:G{i+1}",
+                                [row]
+                            )
+                            response["message"] = f"{action_data['name']}の数量を更新しました。"
+                            break
+                    else:
+                        response["message"] = f"{action_data['name']}が見つかりませんでした。"
+                except Exception as e:
+                    print(f"材料更新中にエラーが発生: {str(e)}")  # デバッグ用
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"材料の更新中にエラーが発生しました: {str(e)}"
+                    )
+            
+            elif action_type == "delete_ingredient":
+                try:
+                    ingredients = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Ingredients!A:G")
+                    for i, row in enumerate(ingredients[1:], 1):  # ヘッダー行をスキップ
+                        if row[1] == action_data["name"]:
+                            delete_sheet(
+                                os.getenv("GOOGLE_SHEETS_ID"),
+                                f"Ingredients!A{i+1}:G{i+1}"
+                            )
+                            response["message"] = f"{action_data['name']}を削除しました。"
+                            break
+                    else:
+                        response["message"] = f"{action_data['name']}が見つかりませんでした。"
+                except Exception as e:
+                    print(f"材料削除中にエラーが発生: {str(e)}")  # デバッグ用
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"材料の削除中にエラーが発生しました: {str(e)}"
+                    )
+            
+            elif action_type == "search_recipes":
+                try:
+                    recipes = read_sheet(os.getenv("GOOGLE_SHEETS_ID"), "Recipes!A:G")
+                    query = action_data.get("query", "").lower()
+                    matching_recipes = [
+                        {
+                            "name": row[1],
+                            "ingredients": row[2],
+                            "servings": row[3],
+                            "url": row[4],
+                            "category": row[5]
+                        }
+                        for row in recipes[1:]  # ヘッダー行をスキップ
+                        if query in row[1].lower() or query in row[2].lower()
+                    ]
+                    if matching_recipes:
+                        response["recipes"] = matching_recipes
+                        response["message"] = f"「{query}」の検索結果です。"
+                    else:
+                        response["message"] = "条件に一致するレシピが見つかりませんでした。"
+                except Exception as e:
+                    print(f"レシピ検索中にエラーが発生: {str(e)}")  # デバッグ用
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"レシピの検索中にエラーが発生しました: {str(e)}"
+                    )
+            
+            elif action_type == "error":
+                raise HTTPException(status_code=400, detail=action_data.get("message", "エラーが発生しました。"))
+        
+        return response
+    
     except Exception as e:
-        print(f"Error in chat endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) 
+        print(f"チャット処理中にエラーが発生: {str(e)}")  # デバッグ用
+        raise HTTPException(
+            status_code=500,
+            detail=f"チャットの処理中にエラーが発生しました: {str(e)}"
+        ) 
